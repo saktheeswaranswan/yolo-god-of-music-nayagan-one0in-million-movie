@@ -1,0 +1,421 @@
+let poseData = [];
+let poseMap = {};
+let mainVideo, video2;
+let poseTime = 0;
+let showPose = true;
+let scaleCycle = [1.0, 0.75, 0.5, 0.25];
+let scaleIndex = 0;
+let scaleFactor = scaleCycle[scaleIndex];
+let offsetX = 0, offsetY = 0;
+let isDragging = false, dragStartX, dragStartY;
+const fps = 30;
+let posePlaying = false;
+let posePlaybackRate = 1;
+let sliderMain, sliderSecond, speedInput;
+let volumeSlider;
+const skeletonEdges = [
+  [5, 7], [7, 9], [6, 8], [8, 10],
+  [11, 13], [13, 15], [12, 14], [14, 16],
+  [5, 6], [11, 12], [5, 11], [6, 12]
+];
+
+// 7 emoji "cute girls / barbie" set (will cycle fast)
+const headEmojis = ["👱‍♀️","💁‍♀️","👩‍🦰","👩‍🦱","👩‍🦳","👸","🧚‍♀️"];
+const crownEmoji = "👑";
+
+let loopPoseUntilVideoEnds = false; // toggle state
+
+// store previous frame head positions for simple velocity (used to drive dancing)
+let lastHeads = [];
+
+// ---------- emoji global scale control (now mutable) ----------
+let emojiGlobalScale = 5; // default 5 (user requested). Slider will update this.
+let emojiScaleSlider, emojiScaleLabel;
+
+function preload() {
+  poseData = loadJSON('theennpannddiicheee.json');
+  mainVideo = createVideo(['ghhgfgf.mp4']);
+  video2 = createVideo(['ghhgfgf.mp4']);
+}
+
+function setup() {
+  createCanvas(1280, 920);
+  frameRate(fps);
+
+  mainVideo.hide();
+  video2.hide();
+
+  // Mute main video
+  mainVideo.volume(0);
+  mainVideo.elt.muted = true;
+  mainVideo.loop();
+
+  // Enable sound for second video
+  video2.volume(1);
+  video2.elt.muted = false;
+  video2.loop();
+
+  // Load pose data into map (works whether poseData is array or object)
+  (Array.isArray(poseData) ? poseData : Object.values(poseData)).forEach(entry => {
+    if (!poseMap[entry.frame_id]) poseMap[entry.frame_id] = [];
+    poseMap[entry.frame_id].push(entry.keypoints);
+  });
+
+  const yBase = height - 120;
+
+  // === MAIN VIDEO CONTROLS ===
+  createButton('Play Main').position(20, yBase).mousePressed(() => mainVideo.play());
+  createButton('Pause Main').position(100, yBase).mousePressed(() => mainVideo.pause());
+  createButton('Stop Main').position(180, yBase).mousePressed(() => { mainVideo.pause(); mainVideo.time(0); });
+  createButton('<< -10s Main').position(260, yBase).mousePressed(() => mainVideo.time(max(0, mainVideo.time() - 10)));
+  createButton('+10s Main').position(360, yBase).mousePressed(() => mainVideo.time(min(mainVideo.duration(), mainVideo.time() + 10)));
+
+  // === SECOND VIDEO CONTROLS ===
+  createButton('Play Second').position(620, yBase).mousePressed(() => video2.play());
+  createButton('Pause Second').position(720, yBase).mousePressed(() => video2.pause());
+  createButton('Stop Second').position(820, yBase).mousePressed(() => { video2.pause(); video2.time(0); });
+  createButton('<< -10s Second').position(920, yBase).mousePressed(() => video2.time(max(0, video2.time() - 10)));
+  createButton('+10s Second').position(1040, yBase).mousePressed(() => video2.time(min(video2.duration(), video2.time() + 10)));
+
+  // Load video durations and create sliders
+  mainVideo.elt.onloadedmetadata = () => {
+    sliderMain = createSlider(0, mainVideo.duration(), 0, 0.01)
+      .position(20, yBase + 30).style('width', '600px')
+      .input(() => mainVideo.time(sliderMain.value()));
+  };
+
+  video2.elt.onloadedmetadata = () => {
+    sliderSecond = createSlider(0, video2.duration(), 0, 0.01)
+      .position(660, yBase + 30).style('width', '600px')
+      .input(() => video2.time(sliderSecond.value()));
+  };
+
+  // === POSE CONTROLS ===
+  const poseY = yBase + 70;
+  createButton('Play Pose').position(20, poseY).mousePressed(() => {
+    posePlaying = true;
+    mainVideo.pause();
+  });
+  createButton('Pause Pose').position(100, poseY).mousePressed(() => posePlaying = false);
+  createButton('Stop Pose').position(180, poseY).mousePressed(() => {
+    posePlaying = false;
+    poseTime = 0;
+    mainVideo.pause();
+  });
+  createButton('<< -10s Pose').position(260, poseY).mousePressed(() => {
+    poseTime = max(poseTime - 10, 0);
+    mainVideo.pause();
+  });
+  createButton('+10s Pose').position(360, poseY).mousePressed(() => {
+    poseTime = min(poseTime + 10, mainVideo.duration());
+    mainVideo.pause();
+  });
+
+  // New toggle button for looping behavior
+  const loopToggle = createButton('Loop Pose Until Video Ends: OFF')
+    .position(460, poseY).mousePressed(() => {
+      loopPoseUntilVideoEnds = !loopPoseUntilVideoEnds;
+      loopToggle.html(`Loop Pose Until Video Ends: ${loopPoseUntilVideoEnds ? 'ON' : 'OFF'}`);
+    });
+
+  createSpan('Speed:').position(640, poseY + 5);
+  speedInput = createInput('1.0').position(700, poseY).size(40);
+  speedInput.input(() => {
+    const val = parseFloat(speedInput.value());
+    posePlaybackRate = isNaN(val) ? 1 : val;
+  });
+
+  // emoji scale slider (1..20)
+  createSpan('Emoji Scale:').position(860, poseY + 5);
+  emojiScaleSlider = createSlider(1, 20, emojiGlobalScale, 1)
+    .position(940, poseY).style('width', '160px')
+    .input(() => {
+      emojiGlobalScale = emojiScaleSlider.value();
+      if (emojiScaleLabel) emojiScaleLabel.html(` ${emojiGlobalScale}`);
+    });
+  emojiScaleLabel = createSpan(` ${emojiGlobalScale}`).position(1110, poseY + 5);
+
+  // === VOLUME SLIDER FOR SECOND VIDEO ===
+  createSpan('🔊 Vol:').position(20, yBase + 60);
+  volumeSlider = createSlider(0, 1, 1, 0.01).position(60, yBase + 60).style('width', '200px');
+}
+
+function draw() {
+  background(0);
+
+  if (mainVideo.elt.readyState >= 2) {
+    image(mainVideo, 0, 0, 640, 720);
+    if (sliderMain) sliderMain.value(mainVideo.time());
+  }
+
+  if (video2.elt.readyState >= 2) {
+    image(video2, 640, 0, 640, 720);
+    if (sliderSecond) sliderSecond.value(video2.time());
+    if (volumeSlider) video2.volume(volumeSlider.value());
+  }
+
+  // --- POSE TIMING: looping behaviour adjusted by loopPoseUntilVideoEnds ---
+  const dur = (mainVideo && typeof mainVideo.duration === 'function') ? mainVideo.duration() : 0;
+
+  if (posePlaying) {
+    poseTime += (deltaTime / 1000) * posePlaybackRate;
+
+    if (dur > 0) {
+      if (loopPoseUntilVideoEnds) {
+        if (!mainVideo.elt.loop) {
+          if (mainVideo.elt.readyState >= 2 && mainVideo.time() >= dur - 0.05) {
+            poseTime = dur;
+            posePlaying = false;
+          } else {
+            poseTime = poseTime % dur;
+            if (poseTime < 0) poseTime += dur;
+          }
+        } else {
+          poseTime = poseTime % dur;
+          if (poseTime < 0) poseTime += dur;
+        }
+      } else {
+        poseTime = poseTime % dur;
+        if (poseTime < 0) poseTime += dur;
+      }
+    }
+  } else if (!mainVideo.elt.paused) {
+    poseTime = mainVideo.time();
+  }
+
+  if (mainVideo.elt.paused) {
+    if (dur > 0) mainVideo.time(constrain(poseTime, 0, max(0.0001, dur)));
+    else mainVideo.time(poseTime);
+  }
+
+  if (showPose) drawPoseOverlay();
+}
+
+/*
+  drawPoseOverlay — new approach:
+  - compute screen coordinates for each keypoint using:
+      tx = x * scaleX
+      ty = y * scaleY
+      tx *= scaleFactor; ty *= scaleFactor;
+      tx += shear * ty;  // shear factor applied to Y after scaling
+      screenX = offsetX + tx; screenY = offsetY + ty;
+  - draw skeleton & small dots using those screen coords (so perfectly aligned)
+  - draw emoji at same screen coords but not sheared (emoji drawn using screen coords)
+  - emoji has a dance bob/pulse driven by poseTime and head velocity
+*/
+function drawPoseOverlay() {
+  const frameIndex = floor(poseTime * fps);
+  const persons = poseMap[frameIndex] || [];
+
+  // robust fallback for video dimension until metadata loaded
+  const vidW = (mainVideo.elt.videoWidth && mainVideo.elt.videoWidth > 0) ? mainVideo.elt.videoWidth : 640;
+  const vidH = (mainVideo.elt.videoHeight && mainVideo.elt.videoHeight > 0) ? mainVideo.elt.videoHeight : 720;
+  const scaleX = 640 / vidW;
+  const scaleY = 720 / vidH;
+
+  // shear value (same as shearX(-0.12) used earlier). Keep negative to lean left.
+  const shearAngle = -0.12; // radians
+  const shearFactor = Math.tan(shearAngle);
+
+  // We'll build an array of transformed keypoints per person in screen coords
+  let personsScreen = []; // each entry: {kpts:[{x,y}], head:{x,y}, shoulderDist}
+
+  persons.forEach((kpts, pIndex) => {
+    // convert each keypoint to screen space with scaling + shear
+    const kptsScreen = kpts.map(pt => {
+      if (!pt) return null;
+      let x = pt[0], y = pt[1];
+      // scale to video display
+      let tx = x * scaleX;
+      let ty = y * scaleY;
+      // apply overall overlay scale
+      tx *= scaleFactor;
+      ty *= scaleFactor;
+      // shearX: x' = x + tan(angle) * y
+      tx = tx + shearFactor * ty;
+      // screen coords with offsets
+      const screenX = offsetX + tx;
+      const screenY = offsetY + ty;
+      return { x: screenX, y: screenY, rawX: x, rawY: y };
+    });
+
+    // determine head keypoint screen position (prefer nose index 0; else eyes)
+    let headScreen = null;
+    if (kptsScreen[0]) headScreen = kptsScreen[0];
+    else {
+      const le = kptsScreen[1], re = kptsScreen[2];
+      if (le && re) headScreen = { x: (le.x + re.x) / 2, y: (le.y + re.y) / 2 };
+      else if (le) headScreen = le;
+      else if (re) headScreen = re;
+    }
+
+    // approximate shoulder distance in screen space for sizing
+    let shoulderDist = null;
+    if (kptsScreen[5] && kptsScreen[6]) {
+      const dx = (kptsScreen[5].x - kptsScreen[6].x);
+      const dy = (kptsScreen[5].y - kptsScreen[6].y);
+      shoulderDist = sqrt(dx * dx + dy * dy);
+    }
+
+    personsScreen.push({ kptsScreen, headScreen, shoulderDist });
+  });
+
+  // --- Draw skeleton & dots using screen coords (they'll match exactly) ---
+  // skeleton style (thin, yellow, SQUARE cap to keep lean look)
+  stroke(255, 255, 0);
+  strokeWeight(4 / max(0.001, scaleFactor));
+  strokeCap(SQUARE);
+
+  // Draw keypoint dots smaller (10px)
+  noStroke();
+  fill(255, 0, 0);
+
+  personsScreen.forEach(ps => {
+    // dots
+    ps.kptsScreen.forEach(pt => {
+      if (pt) circle(pt.x, pt.y, 10); // small dots
+    });
+  });
+
+  // skeleton lines (use stroke)
+  stroke(255, 255, 0);
+  strokeWeight(4 / max(0.001, scaleFactor));
+  strokeCap(SQUARE);
+  personsScreen.forEach(ps => {
+    skeletonEdges.forEach(([i, j]) => {
+      const a = ps.kptsScreen[i], b = ps.kptsScreen[j];
+      if (a && b) line(a.x, a.y, b.x, b.y);
+    });
+  });
+
+  // --- Draw emojis at the same computed head screen positions (NOT sheared) ---
+  textAlign(CENTER, CENTER);
+  // compute per-person dance amplitude from head velocity (using lastHeads array)
+  let newLastHeads = [];
+
+  personsScreen.forEach((ps, idx) => {
+    if (!ps.headScreen) {
+      newLastHeads.push(null);
+      return;
+    }
+    const h = ps.headScreen;
+
+    // compute simple velocity magnitude compared to lastHeads
+    let vel = 0;
+    if (lastHeads[idx]) {
+      const dx = h.x - lastHeads[idx].x;
+      const dy = h.y - lastHeads[idx].y;
+      const dt = max(1/ fps, (deltaTime || (1000 / fps)) / 1000);
+      vel = sqrt(dx*dx + dy*dy) / dt; // px/sec
+    }
+
+    // store current for next frame
+    newLastHeads.push({ x: h.x, y: h.y });
+
+    // emoji cycling
+    const emojiIndex = floor(poseTime * 100) % headEmojis.length;
+    const emoji = headEmojis[emojiIndex];
+
+    // size: big default, bigger when shoulders present
+    // apply emojiGlobalScale here (emojiGlobalScale/10 multiplier)
+    let size = 140 * scaleFactor * (emojiGlobalScale / 10);
+    if (ps.shoulderDist) {
+      // Use shoulderDist (already in screen px) to size emoji, bigger multiplier
+      size = constrain(ps.shoulderDist * 3.2, 100, 420) * (emojiGlobalScale / 10);
+    } else {
+      size = max(size, 140 * (emojiGlobalScale / 10));
+    }
+
+    // dancing effect: vertical bob + small scale pulse
+    const velAmp = constrain(vel * 0.02, 0, 18);
+    const baseAmp = 6;
+    const bob = sin(poseTime * 10 + idx * 0.7) * (baseAmp + velAmp) * (emojiGlobalScale / 10);
+    const pulse = 1 + 0.08 * sin(poseTime * 14 + idx * 1.1);
+
+    // final drawn size (clamped)
+    const drawSize = constrain(max(20, size * pulse), 20, 420);
+
+    // draw shadow then emoji (emoji not sheared; uses screen coordinates)
+    fill(0, 200);
+    textSize(drawSize);
+    text(emoji, h.x + 6, h.y + 6 + bob);
+    fill(255);
+    text(emoji, h.x, h.y + bob);
+  });
+
+  // swap lastHeads
+  lastHeads = newLastHeads;
+
+  // --- crown logic: who is closest to left video center (320) ---
+  const leftVideoCenterX = 320;
+  const centerThreshold = 120;
+
+  // find best among personsScreen with headScreen defined and inside left video area
+  let best = null, bestDist = Infinity;
+  personsScreen.forEach(ps => {
+    if (!ps.headScreen) return;
+    const sx = ps.headScreen.x;
+    // only consider heads inside left video (0..640)
+    if (sx >= 0 && sx <= 640) {
+      const d = abs(sx - leftVideoCenterX);
+      if (d < bestDist) {
+        bestDist = d;
+        best = ps;
+      }
+    }
+  });
+
+  if (best && bestDist <= centerThreshold && best.headScreen) {
+    // pick crown size based on screen size approximated from shoulder or fallback
+    const approxScreenSize = best.shoulderDist ? (best.shoulderDist * 3.2 * (emojiGlobalScale / 10)) : (140 * (emojiGlobalScale / 10));
+    const crownSize = constrain(approxScreenSize * 0.6, 24, 260);
+    const crownX = best.headScreen.x;
+    const crownY = best.headScreen.y - ( (best.shoulderDist ? best.shoulderDist : 140) * 0.9 * (emojiGlobalScale / 10) );
+
+    push();
+    textAlign(CENTER, CENTER);
+    textSize(crownSize);
+    fill(0, 200);
+    text(crownEmoji, crownX + 6, crownY + 6);
+    fill(255, 215, 0);
+    text(crownEmoji, crownX, crownY);
+    pop();
+  }
+}
+
+// ---- interaction handlers (unchanged) ----
+function mousePressed() {
+  if (showPose) {
+    isDragging = true;
+    dragStartX = mouseX - offsetX;
+    dragStartY = mouseY - offsetY;
+  }
+}
+
+function mouseDragged() {
+  if (isDragging) {
+    offsetX = mouseX - dragStartX;
+    offsetY = mouseY - dragStartY;
+  }
+}
+
+function mouseReleased() {
+  isDragging = false;
+}
+
+function keyPressed() {
+  const k = key.toUpperCase();
+  if (k === 'T') {
+    showPose = !showPose;
+  } else if (k === 'B') {
+    scaleIndex = (scaleIndex + 1) % scaleCycle.length;
+    scaleFactor = scaleCycle[scaleIndex];
+    console.log(`Pose Scale: ${scaleFactor}`);
+  } else if (k === 'F') {
+    poseTime = min(poseTime + 10, mainVideo.duration());
+    mainVideo.pause();
+  } else if (k === 'R') {
+    poseTime = max(poseTime - 10, 0);
+    mainVideo.pause();
+  }
+}
